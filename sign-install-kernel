@@ -1,0 +1,217 @@
+#!/bin/bash
+
+#set -uex
+
+KEY_FILE="/etc/kernel/MOK.key"
+CERT_FILE="/etc/kernel/MOK.crt"
+
+exit_err() {
+	RC=$?
+	echo "ERROR: $1" >&2
+	exit $RC
+}
+
+[ "$#" -ge 2 ] || exit_err "Expected at least 2 parameters"
+
+. /etc/os-release
+
+[ -n "$ID" ] || exit_err "ID does not appear to be specified in /etc/os-release"
+
+ESP=$(bootctl -p)
+[ -d "$ESP" ] || exit_err "EFI mount point not found: $ESP"
+
+REL_INSTALL_DIR="$ID"
+ABS_INSTALL_DIR="$ESP/$REL_INSTALL_DIR"
+ENTRY_FILE_BASENAME="$ID"
+
+DEFER_REMOVE_FILE="${ABS_INSTALL_DIR}/defer_remove.txt"
+
+declare -a BOOT_OPTIONS
+declare -a INITRD_EXTRAS
+
+sign_install_kernel() {
+	echo "Signing and installing kernel: $2"
+	sbsign --key "$KEY_FILE" --cert "$CERT_FILE" --output "$2" "$1" \
+		&& sbverify --cert "$CERT_FILE" "$2"
+}
+
+make_initramfs() {
+	echo "Generating initial ramdisk image: $2"
+	dracut -qf --kver "$@"
+}
+
+prepare_loader_entry_vars() {
+	[ -n "$PRETTY_NAME" ] \
+		|| exit_err "PRETTY_NAME does not appear to be specified in /etc/os-release"
+
+	MACHINE_ID="$(< /etc/machine-id)"
+	[ -n "$MACHINE_ID" ] || exit_err "Failed to set machine ID"
+
+	BOOT_OPTIONS="$(< /etc/kernel/cmdline)"
+	[ -n "$BOOT_OPTIONS" ] || exit_err "Failed to read kernel command line"
+
+	if [ -f /etc/kernel/initrd-extras ] ; then
+		while read -r extra; do
+			INITRD_EXTRAS+=("$extra")
+		done < /etc/kernel/initrd-extras
+	fi
+
+	while read -r image; do
+		INITRD_EXTRAS+=("$image")
+	done < <(find "$ABS_INSTALL_DIR" \
+			-maxdepth 1 \
+			-name '*ucode.img' \
+			-printf "/${REL_INSTALL_DIR}/%P\\n")
+
+	[ -n "${INITRD_EXTRAS[*]}" ] &&
+		echo "Found additional initramfs images: ${INITRD_EXTRAS[*]}"
+
+}
+
+loader_entry() {
+	echo -n "${ESP}/loader/entries/${1}-${2}.conf"
+}
+
+create_loader_entry() {
+	local title="$1"
+	local base_name="$2"
+	local version="$3"
+	local kernel="$4"
+	local initrds=("${@:5}")
+
+	local entry="$(loader_entry "$base_name" "$version")"
+
+	echo "Createing bootloader entry: $entry"
+
+	{
+		echo "title      $title"
+		echo "version    $version"
+		echo "machine-id $MACHINE_ID"
+		echo "options    ${BOOT_OPTIONS[*]}"
+		echo "linux      $kernel"
+		for initrd in "${initrds[@]}"; do
+			echo "initrd     $initrd"
+		done
+	} > "$entry"
+}
+
+add() {
+	local version="$1"
+	local kernel_source="/lib/modules/${version}/vmlinuz"
+	local kernel_dest_name="vmlinuz-${version}"
+	local initramfs_name="initramfs-${version}"
+	
+	sign_install_kernel \
+		"$kernel_source" \
+		"${ABS_INSTALL_DIR}/${kernel_dest_name}" \
+		|| return
+
+	make_initramfs \
+		"$version" \
+		"${ABS_INSTALL_DIR}/${initramfs_name}.img" \
+		|| return
+
+	create_loader_entry \
+		"$PRETTY_NAME" "$ENTRY_FILE_BASENAME" \
+		"$version" \
+		"/${REL_INSTALL_DIR}/${kernel_dest_name}" \
+		"/${REL_INSTALL_DIR}/${initramfs_name}.img" \
+		"${INITRD_EXTRAS[@]}" \
+		|| return
+
+	make_initramfs \
+		"$version" \
+		"${ABS_INSTALL_DIR}/${initramfs_name}-fallback.img" -N \
+		|| return	
+
+	create_loader_entry \
+		"$PRETTY_NAME Fallback" "${ENTRY_FILE_BASENAME}_fallback" \
+		"$version" \
+		"/${REL_INSTALL_DIR}/${kernel_dest_name}" \
+		"/${REL_INSTALL_DIR}/${initramfs_name}-fallback.img" \
+		"${INITRD_EXTRAS[@]}" 
+}
+
+remove() {
+	local version="$1"
+
+	rm -v \
+		"${ABS_INSTALL_DIR}/vmlinuz-${version}" \
+		"${ABS_INSTALL_DIR}/initramfs-${version}"*.img \
+		"$(loader_entry "$ENTRY_FILE_BASENAME" "$version")" \
+		"$(loader_entry "${ENTRY_FILE_BASENAME}_fallback" "$version")"
+}
+
+add_all() {
+	prepare_loader_entry_vars
+	for version in "${VERSIONS[@]}"; do
+		add "$version"
+	done
+}
+
+remove_all() {
+	local running="$(uname -r)"
+
+	if [ -f "$DEFER_REMOVE_FILE" ]; then
+		VERSIONS+=("$(<"$DEFER_REMOVE_FILE")")
+		rm "$DEFER_REMOVE_FILE"
+	fi
+
+	for version in "${VERSIONS[@]}"; do
+		if [ "$version" = "$running" ]; then
+			echo "Kernel version ${version} is currently running. Will remove next time."
+			echo "$version" > "$DEFER_REMOVE_FILE"
+		fi
+		remove "$version"
+	done
+}
+
+
+
+ACTION="$1"
+shift
+
+declare -a VERSIONS
+if [ "$1" = "all" ]; then
+	for version in $(ls /lib/modules); do
+		[ -f "/lib/modules/${version}/vmlinuz" ] && VERSIONS+=("$version")
+	done
+elif [ "$1" = "existing" ]; then
+	for vmlinuz in "${ABS_INSTALL_DIR}/vmlinuz-"*; do
+		version="${vmlinuz#${ABS_INSTALL_DIR}/vmlinuz-}"
+		[ -f "/lib/modules/${version}/vmlinuz" ] && VERSIONS+=("$version")
+	done
+else
+
+	PATHS="$@"
+
+	if [ "${PATHS[0]}" = "-" ]; then
+		PATHS=()
+		while read -r path; do
+			PATHS+=("$path")
+		done
+	fi
+
+	for path in "${PATHS[@]}"; do
+		[[ "$path" =~ /lib/modules/(.*)/vmlinuz ]] \
+			|| exit_err "Not a kernel path: $path"
+		VERSIONS+=(${BASH_REMATCH[1]})
+	done
+fi
+
+if [ ${#VERSIONS[@]} -eq 0 ]; then
+	echo "Nothing to do."
+	exit
+fi
+
+case "$ACTION" in
+	add)
+		add_all
+		;;
+	remove)
+		remove_all
+		;;
+	*)
+		exit_err "Unknown action: $ACTION"
+		;;
+esac
